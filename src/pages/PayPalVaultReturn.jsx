@@ -14,8 +14,8 @@ function completeVaultOnce(token) {
 }
 
 /**
- * After PayPal vault approval, payer returns with ?token=SETUP_TOKEN (or similar).
- * Exchanges the setup token for a saved payment method via POST /api/payments/paypal/vault/complete.
+ * After PayPal vault approval, payer returns with ?token=…, ?setup_token=…, or (newer flows)
+ * ?approval_token_id=… (and sometimes approval_session_id). Same id is sent to vault/complete.
  */
 export default function PayPalVaultReturn() {
     const { pathname } = useLocation();
@@ -31,6 +31,8 @@ export default function PayPalVaultReturn() {
         searchParams.get('token')?.trim() ||
         searchParams.get('setup_token')?.trim() ||
         searchParams.get('setupTokenId')?.trim() ||
+        searchParams.get('approval_token_id')?.trim() ||
+        searchParams.get('approval_session_id')?.trim() ||
         '';
 
     useEffect(() => {
