@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { loadStripe } from '@stripe/stripe-js';
 import { Elements, CardElement, useStripe, useElements } from '@stripe/react-stripe-js';
 import toast from 'react-hot-toast';
@@ -74,6 +74,40 @@ function extractPaypalRedirect(payload) {
             (l) => l?.rel === 'approve' || l?.rel === 'payer-action',
         );
         if (approve?.href) return approve.href;
+    }
+    return null;
+}
+
+/** Batch pay puts `orderId` on the envelope `data`; ship-in nests the PayPal object under `data.data`. */
+function extractPaypalOrderId(payload) {
+    const root = payload?.data ?? payload;
+    if (typeof root?.orderId === 'string' && root.orderId.trim()) {
+        return root.orderId.trim();
+    }
+    const nested = root?.data;
+    if (nested && typeof nested.orderId === 'string' && nested.orderId.trim()) {
+        return nested.orderId.trim();
+    }
+    return null;
+}
+
+function extractPaypalAlreadyCompleted(payload) {
+    const root = payload?.data ?? payload;
+    if (root?.alreadyCompleted === true) return true;
+    const nested = root?.data;
+    if (nested?.alreadyCompleted === true) return true;
+    return false;
+}
+
+/** Same envelope shapes as `extractPaypalOrderId` (batch vs ship-in). */
+function extractPaymentIdFromPay(payload) {
+    const root = payload?.data ?? payload;
+    if (typeof root?.paymentId === 'string' && root.paymentId.trim()) {
+        return root.paymentId.trim();
+    }
+    const nested = root?.data;
+    if (nested && typeof nested.paymentId === 'string' && nested.paymentId.trim()) {
+        return nested.paymentId.trim();
     }
     return null;
 }
@@ -168,6 +202,7 @@ export default function CheckoutPaymentPanel({
     onCheckoutSummaryPatch,
     onBatchPriceSummaryPatch,
 }) {
+    const navigate = useNavigate();
     const [manualPmId, setManualPmId] = useState('');
     const [useManualStripe, setUseManualStripe] = useState(!publishableKey);
     const [couponDraft, setCouponDraft] = useState('');
@@ -425,12 +460,55 @@ export default function CheckoutPaymentPanel({
             }
             const res = await api.post(payPath, body);
 
+            let paypalImmediateSuccess = provider === 'PAYPAL' && extractPaypalAlreadyCompleted(res.data);
+            /** Saved PayPal (vault) inline: show same confirmation UI as `/paypal/success` redirect flow. */
+            let paypalVaultSuccessNav = null;
             if (provider === 'PAYPAL') {
                 const redirectUrl = extractPaypalRedirect(res.data);
                 if (redirectUrl) {
                     toast.success('Redirecting to PayPal…');
                     window.location.assign(redirectUrl);
                     return;
+                }
+                if (!paypalImmediateSuccess) {
+                    const orderId = extractPaypalOrderId(res.data);
+                    if (orderId) {
+                        try {
+                            const capRes = await api.post('/payments/capture-paypal', { orderId });
+                            const cap = capRes?.data;
+                            const capStatus = String(cap?.captureStatus ?? '').toUpperCase();
+                            paypalImmediateSuccess =
+                                cap?.alreadyCompleted === true || capStatus === 'COMPLETED';
+                            if (paypalImmediateSuccess && paypalPaySource === 'saved') {
+                                paypalVaultSuccessNav = {
+                                    orderId,
+                                    captureResult: cap,
+                                };
+                            }
+                        } catch (captureErr) {
+                            toast.error(
+                                captureErr?.response?.data?.error ||
+                                    (typeof captureErr?.response?.data === 'string'
+                                        ? captureErr.response.data
+                                        : null) ||
+                                    captureErr?.message ||
+                                    'Could not capture PayPal payment.',
+                            );
+                            window.dispatchEvent(new Event('customer-notification:new'));
+                            return;
+                        }
+                    }
+                } else if (paypalPaySource === 'saved') {
+                    const oid = extractPaypalOrderId(res.data) || '';
+                    paypalVaultSuccessNav = {
+                        orderId: oid,
+                        captureResult: {
+                            paymentId: extractPaymentIdFromPay(res.data),
+                            captureStatus: 'COMPLETED',
+                            paypalCaptureId: null,
+                            alreadyCompleted: true,
+                        },
+                    };
                 }
             }
 
@@ -439,7 +517,16 @@ export default function CheckoutPaymentPanel({
             const stripeChargeSucceeded =
                 provider === 'STRIPE' && String(payStatus ?? '').toLowerCase() === 'succeeded';
 
-            toast.success(stripeChargeSucceeded ? 'Payment successful' : 'Payment submitted');
+            const skipPaypalToastForVaultSuccessPage =
+                provider === 'PAYPAL' && paypalImmediateSuccess && paypalVaultSuccessNav;
+
+            if (!skipPaypalToastForVaultSuccessPage) {
+                toast.success(
+                    stripeChargeSucceeded || paypalImmediateSuccess
+                        ? 'Payment successful'
+                        : 'Payment submitted',
+                );
+            }
 
             if (
                 provider === 'STRIPE' &&
@@ -463,6 +550,17 @@ export default function CheckoutPaymentPanel({
             }
 
             await onPaidSuccess?.();
+
+            if (paypalVaultSuccessNav?.captureResult) {
+                navigate('/paypal/success', {
+                    replace: true,
+                    state: {
+                        inlineVaultCapture: true,
+                        orderId: paypalVaultSuccessNav.orderId,
+                        captureResult: paypalVaultSuccessNav.captureResult,
+                    },
+                });
+            }
         } catch (err) {
             toast.error(err?.response?.data?.error || 'Payment failed');
             window.dispatchEvent(new Event('customer-notification:new'));

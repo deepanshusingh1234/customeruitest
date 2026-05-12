@@ -23,7 +23,7 @@ function capturePayPalOnce(orderId) {
  * Approval alone does not charge the buyer — we must call POST /api/payments/capture-paypal.
  */
 export default function PayPalReturn() {
-    const { pathname } = useLocation();
+    const { pathname, state: locationState } = useLocation();
     const navigate = useNavigate();
     const [searchParams] = useSearchParams();
     const isCancel = pathname.includes('/paypal/cancel');
@@ -31,6 +31,8 @@ export default function PayPalReturn() {
     const [phase, setPhase] = useState(() => (isCancel ? 'cancelled' : 'pending')); // pending | capturing | done | error | cancelled | missing_token
     /** Set when capture API returns (paymentId = internal payment row; PayPal order id is in URL `token`). */
     const [captureResult, setCaptureResult] = useState(null);
+    /** PayPal order id for display: URL `token` after redirect, or passed from saved-PayPal inline checkout. */
+    const [displayOrderId, setDisplayOrderId] = useState('');
 
     const orderId = searchParams.get('token')?.trim() ?? '';
     const navigateTimerRef = useRef(null);
@@ -39,6 +41,29 @@ export default function PayPalReturn() {
         if (isCancel) {
             toast.error('PayPal checkout was cancelled.');
             return;
+        }
+
+        const inline =
+            locationState?.inlineVaultCapture === true &&
+            locationState?.captureResult &&
+            typeof locationState.captureResult === 'object';
+
+        if (inline) {
+            setCaptureResult(locationState.captureResult);
+            setDisplayOrderId(String(locationState.orderId ?? '').trim());
+            setPhase('done');
+            toast.success('Payment completed.', { id: 'paypal-return-done' });
+            window.dispatchEvent(new Event('customer-notification:new'));
+            navigateTimerRef.current = setTimeout(() => {
+                navigateTimerRef.current = null;
+                navigate('/dashboard', { replace: true });
+            }, 4500);
+            return () => {
+                if (navigateTimerRef.current) {
+                    clearTimeout(navigateTimerRef.current);
+                    navigateTimerRef.current = null;
+                }
+            };
         }
 
         if (!orderId) {
@@ -54,6 +79,7 @@ export default function PayPalReturn() {
             return;
         }
 
+        setDisplayOrderId(orderId);
         setPhase('capturing');
 
         (async () => {
@@ -61,7 +87,7 @@ export default function PayPalReturn() {
                 const data = await capturePayPalOnce(orderId);
                 setCaptureResult(data);
                 setPhase('done');
-                toast.success('Payment completed.');
+                toast.success('Payment completed.', { id: 'paypal-return-done' });
                 window.dispatchEvent(new Event('customer-notification:new'));
                 navigateTimerRef.current = setTimeout(() => {
                     navigateTimerRef.current = null;
@@ -84,7 +110,7 @@ export default function PayPalReturn() {
                 navigateTimerRef.current = null;
             }
         };
-    }, [isCancel, navigate, orderId]);
+    }, [isCancel, locationState, navigate, orderId]);
 
     const title =
         isCancel ? 'Payment cancelled' : phase === 'capturing' ? 'Completing payment…' : phase === 'done' ? 'Payment successful' : phase === 'missing_token' ? 'Missing order' : phase === 'error' ? 'Payment not completed' : 'PayPal';
@@ -133,7 +159,9 @@ export default function PayPalReturn() {
                             )}
                             <div>
                                 <dt className="text-xs font-medium uppercase tracking-wide text-slate-500">PayPal order id</dt>
-                                <dd className="mt-0.5 break-all font-mono text-xs">{orderId}</dd>
+                                <dd className="mt-0.5 break-all font-mono text-xs">
+                                    {displayOrderId || orderId || '—'}
+                                </dd>
                             </div>
                         </dl>
                     </div>
@@ -147,7 +175,8 @@ export default function PayPalReturn() {
                 {!isCancel && phase === 'error' && (
                     <p className="mt-4 text-xs text-slate-500">
                         If PayPal already charged you but this failed, check your PayPal activity and contact support with
-                        order id <code className="rounded bg-slate-100 px-1">{orderId || '—'}</code>.
+                        order id{' '}
+                        <code className="rounded bg-slate-100 px-1">{displayOrderId || orderId || '—'}</code>.
                     </p>
                 )}
             </div>
