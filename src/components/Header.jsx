@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { useAuth } from '../contexts/AuthContext';
-import { Bell, LogOut, User, Package } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { LogOut, User, Package, CreditCard } from 'lucide-react';
 import NotificationBell from './NotificationBell';
 
 const Header = () => {
@@ -47,6 +48,14 @@ const Header = () => {
                                             <p className="text-sm font-medium text-gray-900">{user?.name}</p>
                                             <p className="text-xs text-gray-500">{user?.email}</p>
                                         </div>
+                                        <Link
+                                            to="/settings/payment"
+                                            onClick={() => setShowUserMenu(false)}
+                                            className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 flex items-center space-x-2"
+                                        >
+                                            <CreditCard className="w-4 h-4" />
+                                            <span>Saved payments</span>
+                                        </Link>
                                         <button
                                             onClick={logout}
                                             className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-gray-100 flex items-center space-x-2"

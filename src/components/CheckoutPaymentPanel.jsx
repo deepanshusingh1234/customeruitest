@@ -1,9 +1,29 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { loadStripe } from '@stripe/stripe-js';
 import { Elements, CardElement, useStripe, useElements } from '@stripe/react-stripe-js';
 import toast from 'react-hot-toast';
-import { CreditCard, Lock } from 'lucide-react';
+import { CreditCard, Lock, Tag, X } from 'lucide-react';
 import api from '../lib/api';
+import { attachPaymentMethod, listPaymentMethods } from '../lib/paymentMethodsApi';
+import { paypalCheckoutReturnUrls } from '../lib/paymentOrigin';
+
+const MAX_COUPONS = 8;
+
+function normalizeCouponCodes(list) {
+    const out = [];
+    for (const x of list || []) {
+        const s = String(x ?? '').trim();
+        if (!s) continue;
+        const up = s.toUpperCase();
+        if (!out.includes(up) && out.length < MAX_COUPONS) out.push(up);
+    }
+    return out;
+}
+
+function couponPricingFromSummary(summary) {
+    return summary?.couponPricing ?? summary?.pricing ?? null;
+}
 
 const publishableKey = import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY || '';
 
@@ -24,38 +44,23 @@ const cardElementOptions = {
     },
 };
 
-/** Base URL for PayPal return/cancel links (must be absolute). Prefer env if origin differs from window (e.g. reverse proxy). */
-function getAppPublicOrigin() {
-    const fromEnv = import.meta.env.VITE_APP_ORIGIN || import.meta.env.VITE_PUBLIC_APP_URL;
-    if (fromEnv && String(fromEnv).trim()) {
-        return String(fromEnv).replace(/\/$/, '');
-    }
-    if (typeof window !== 'undefined') {
-        return window.location.origin;
-    }
-    return '';
-}
-
-function paypalReturnUrls() {
-    const base = getAppPublicOrigin();
-    return {
-        returnUrl: `${base}/paypal/success`,
-        cancelUrl: `${base}/paypal/cancel`,
-    };
-}
-
-/** PayPal / display: use locked carrier quote first (matches dropdown), then summary API. */
+/** PayPal / display: prefer coupon-adjusted total from summary, then locked carrier quote. */
 function resolveCheckoutMoney(lockedCarrierOption, summary) {
+    const couponPricing = couponPricingFromSummary(summary);
     const fromLocked = String(lockedCarrierOption?.currency ?? '').trim().toUpperCase();
     const fromSummary = String(summary?.currency ?? '').trim().toUpperCase();
     const currency = fromLocked || fromSummary;
-    const amount =
+    const baseSummaryAmount =
         summary?.finalAmount != null && summary.finalAmount !== ''
             ? summary.finalAmount
             : lockedCarrierOption?.total != null && lockedCarrierOption?.total !== ''
                 ? lockedCarrierOption.total
                 : undefined;
-    return { currency, amount, fromLocked, fromSummary };
+    const amount =
+        couponPricing?.finalAmount != null && couponPricing.finalAmount !== ''
+            ? couponPricing.finalAmount
+            : baseSummaryAmount;
+    return { currency, amount, fromLocked, fromSummary, couponPricing };
 }
 
 function extractPaypalRedirect(payload) {
@@ -73,7 +78,7 @@ function extractPaypalRedirect(payload) {
     return null;
 }
 
-function StripePayForm({ disabled, onPay, busy }) {
+function StripePayForm({ disabled, onPay, busy, saveForFuture, onSaveForFutureChange }) {
     const stripe = useStripe();
     const elements = useElements();
     const [cardReady, setCardReady] = useState(false);
@@ -96,7 +101,11 @@ function StripePayForm({ disabled, onPay, busy }) {
             toast.error(error.message || 'Card validation failed');
             return;
         }
-        await onPay({ provider: 'STRIPE', paymentMethodId: paymentMethod.id });
+        await onPay({
+            provider: 'STRIPE',
+            paymentMethodId: paymentMethod.id,
+            saveForFuture: Boolean(saveForFuture),
+        });
     };
 
     return (
@@ -113,6 +122,16 @@ function StripePayForm({ disabled, onPay, busy }) {
             <div className="rounded-lg border border-slate-200 bg-slate-50/80 px-3 py-3">
                 <CardElement options={cardElementOptions} onReady={() => setCardReady(true)} />
             </div>
+            <label className="mt-3 flex cursor-pointer items-start gap-2 text-sm text-slate-700">
+                <input
+                    type="checkbox"
+                    className="mt-0.5 h-4 w-4 shrink-0 rounded border-slate-300 text-[#635BFF] focus:ring-[#635BFF]"
+                    checked={Boolean(saveForFuture)}
+                    onChange={(e) => onSaveForFutureChange?.(e.target.checked)}
+                    disabled={disabled || busy}
+                />
+                <span>Save this card for future checkout</span>
+            </label>
             <button
                 type="button"
                 disabled={disabled || busy || !stripe || !cardReady}
@@ -129,13 +148,15 @@ function StripePayForm({ disabled, onPay, busy }) {
 /**
  * Stripe Card Element (set VITE_STRIPE_PUBLISHABLE_KEY) or manual pm id; PayPal CTA with redirect when API returns a URL.
  *
- * @param {'shipin'|'batch'} checkoutMode — `shipin`: POST `/customer/checkout/shipin/:id/pay`. `batch`: POST `/customer/batches/:batchId/pay`.
+ * @param {'shipin'|'batch'} checkoutMode — `shipin`: POST `/customer/checkout/shipin/:id/pay`. `batch`: POST `/customer/batches/pay` (stateless).
  * @param {string} [shipmentId] — required when checkoutMode is `shipin`.
- * @param {string} [batchId] — required when checkoutMode is `batch`.
+ * @param {{ shipInIds: string[], addressId: string, carrierName: string, carrierService?: string, addonServices?: object }} [batchContext] — required when checkoutMode is `batch`.
+ * @param {(patch: object) => void} [onCheckoutSummaryPatch] — merge ship-in coupon apply (`POST .../coupons`) into dashboard summary state.
+ * @param {(patch: object) => void} [onBatchPriceSummaryPatch] — merge batch coupon preview (`POST .../batches/coupons/preview`) into `batchPriceSummary`.
  */
 export default function CheckoutPaymentPanel({
     shipmentId,
-    batchId,
+    batchContext,
     checkoutMode = 'shipin',
     summary,
     /** Selected rate row from Get Rates (currency/total match what the customer chose). */
@@ -144,11 +165,80 @@ export default function CheckoutPaymentPanel({
     busy,
     onBusyChange,
     onPaidSuccess,
+    onCheckoutSummaryPatch,
+    onBatchPriceSummaryPatch,
 }) {
     const [manualPmId, setManualPmId] = useState('');
     const [useManualStripe, setUseManualStripe] = useState(!publishableKey);
+    const [couponDraft, setCouponDraft] = useState('');
+    const [couponBusy, setCouponBusy] = useState(false);
 
-    const { currency: payCurrency, amount: payAmount, fromLocked, fromSummary } = resolveCheckoutMoney(
+    /** @type {[Array<Record<string, unknown>>, function]} */
+    const [savedPaymentMethods, setSavedPaymentMethods] = useState([]);
+    /** Which processor the customer is paying with (Stripe vs PayPal are mutually exclusive in the UI). */
+    const [activeWallet, setActiveWallet] = useState('STRIPE');
+    const [stripePaySource, setStripePaySource] = useState('new');
+    const [selectedStripePmId, setSelectedStripePmId] = useState('');
+    const [paypalPaySource, setPaypalPaySource] = useState('redirect');
+    const [selectedPaypalVaultId, setSelectedPaypalVaultId] = useState('');
+    const [saveNewCardAfterPay, setSaveNewCardAfterPay] = useState(false);
+
+    const couponCodes = normalizeCouponCodes(summary?.couponCodes ?? []);
+
+    const batchShipInKey =
+        checkoutMode === 'batch' && Array.isArray(batchContext?.shipInIds)
+            ? batchContext.shipInIds.join(',')
+            : '';
+
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const list = await listPaymentMethods();
+                if (cancelled) return;
+                setSavedPaymentMethods(Array.isArray(list) ? list : []);
+                const stripeRows = (list || []).filter(
+                    (m) => m.provider === 'STRIPE' && String(m.stripePaymentMethodId || '').trim(),
+                );
+                const pick =
+                    stripeRows.find((m) => m.isDefault) || (stripeRows.length ? stripeRows[0] : null);
+                const ppRows = (list || []).filter(
+                    (m) => m.provider === 'PAYPAL' && String(m.paypalVaultId || '').trim(),
+                );
+                const ppPick =
+                    ppRows.find((m) => m.isDefault) || (ppRows.length === 1 ? ppRows[0] : null);
+                if (pick?.stripePaymentMethodId) {
+                    setActiveWallet('STRIPE');
+                    setStripePaySource('saved');
+                    setSelectedStripePmId(String(pick.stripePaymentMethodId));
+                    setSaveNewCardAfterPay(false);
+                    setPaypalPaySource('redirect');
+                } else if (!stripeRows.length && ppRows.length) {
+                    setActiveWallet('PAYPAL');
+                    setStripePaySource('new');
+                    setSelectedStripePmId('');
+                    setPaypalPaySource(ppPick?.paypalVaultId ? 'saved' : 'redirect');
+                } else {
+                    setActiveWallet('STRIPE');
+                    setStripePaySource('new');
+                    setSelectedStripePmId('');
+                    setPaypalPaySource('redirect');
+                }
+                if (ppPick?.paypalVaultId) {
+                    setSelectedPaypalVaultId(String(ppPick.paypalVaultId));
+                } else {
+                    setSelectedPaypalVaultId(ppRows[0] ? String(ppRows[0].paypalVaultId) : '');
+                }
+            } catch {
+                if (!cancelled) setSavedPaymentMethods([]);
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [shipmentId, checkoutMode, batchShipInKey]);
+
+    const { currency: payCurrency, amount: payAmount, fromLocked, fromSummary, couponPricing } = resolveCheckoutMoney(
         lockedCarrierOption,
         summary,
     );
@@ -159,41 +249,178 @@ export default function CheckoutPaymentPanel({
 
     const payPath =
         checkoutMode === 'batch'
-            ? `/customer/batches/${batchId}/pay`
+            ? '/customer/batches/pay'
             : `/customer/checkout/shipin/${shipmentId}/pay`;
 
-    const completePay = async ({ provider, paymentMethodId }) => {
+    const persistShipInCoupons = async (codes) => {
+        if (!shipmentId?.trim()) return;
+        setCouponBusy(true);
+        try {
+            const res = await api.post(`/customer/checkout/shipin/${shipmentId.trim()}/coupons`, {
+                codes: normalizeCouponCodes(codes),
+            });
+            const data = res?.data?.data;
+            const patch = data
+                ? {
+                      ...data,
+                      couponPricing: data.couponPricing ?? data.pricing ?? null,
+                  }
+                : null;
+            onCheckoutSummaryPatch?.(patch);
+            toast.success(!codes.length ? 'Coupons cleared' : 'Coupons updated');
+        } catch (err) {
+            toast.error(err?.response?.data?.error || 'Could not apply coupon');
+        } finally {
+            setCouponBusy(false);
+        }
+    };
+
+    const persistBatchCouponsPreview = async (codes) => {
+        if (!batchContext?.shipInIds?.length) return;
+        setCouponBusy(true);
+        try {
+            const res = await api.post('/customer/batches/coupons/preview', {
+                shipInIds: batchContext.shipInIds,
+                addressId: batchContext.addressId,
+                carrierName: batchContext.carrierName,
+                ...(batchContext.carrierService ? { carrierService: batchContext.carrierService } : {}),
+                ...(batchContext.addonServices ? { addonServices: batchContext.addonServices } : {}),
+                codes: normalizeCouponCodes(codes),
+            });
+            const data = res?.data?.data;
+            const patch = data
+                ? {
+                      ...data,
+                      couponPricing: data.couponPricing ?? data.pricing ?? null,
+                      couponCodes: Array.isArray(data.couponCodes) ? normalizeCouponCodes(data.couponCodes) : [],
+                  }
+                : null;
+            onBatchPriceSummaryPatch?.(patch);
+            toast.success(!codes.length ? 'Coupons cleared' : 'Coupons updated');
+        } catch (err) {
+            toast.error(err?.response?.data?.error || 'Could not apply coupon');
+        } finally {
+            setCouponBusy(false);
+        }
+    };
+
+    const addCouponFromDraft = async () => {
+        const code = couponDraft.trim();
+        if (!code) {
+            toast.error('Enter a coupon code');
+            return;
+        }
+        const next = normalizeCouponCodes([...couponCodes, code]);
         if (checkoutMode === 'batch') {
-            if (!batchId?.trim()) {
-                toast.error('Missing batch id');
+            await persistBatchCouponsPreview(next);
+        } else {
+            await persistShipInCoupons(next);
+        }
+        setCouponDraft('');
+    };
+
+    const removeCouponCode = async (code) => {
+        const next = couponCodes.filter((c) => c !== code);
+        if (checkoutMode === 'batch') {
+            await persistBatchCouponsPreview(next);
+            return;
+        }
+        await persistShipInCoupons(next);
+    };
+
+    const clearAllCoupons = async () => {
+        if (checkoutMode === 'batch') {
+            await persistBatchCouponsPreview([]);
+            return;
+        }
+        await persistShipInCoupons([]);
+    };
+
+    const completePay = async ({ provider, paymentMethodId, saveForFuture = false }) => {
+        if (checkoutMode === 'batch') {
+            if (!batchContext?.shipInIds?.length) {
+                toast.error('Missing batch checkout data');
                 return;
             }
         } else if (!shipmentId) {
             return;
         }
-        if (provider === 'STRIPE' && !paymentMethodId?.trim()) {
-            toast.error('Add a card or enter a payment method id');
+
+        let effectiveStripePm = '';
+        if (provider === 'STRIPE') {
+            if (useManualStripe) {
+                effectiveStripePm = String(manualPmId || '').trim();
+            } else if (stripePaySource === 'saved') {
+                effectiveStripePm = String(selectedStripePmId || '').trim();
+            } else {
+                effectiveStripePm = String(paymentMethodId || '').trim();
+            }
+            if (!effectiveStripePm) {
+                toast.error('Choose a saved card, add a card, or enter a payment method id');
+                return;
+            }
+        }
+
+        const hasSavedPaypalMethods = savedPaymentMethods.some(
+            (m) => m.provider === 'PAYPAL' && String(m.paypalVaultId || '').trim(),
+        );
+        if (provider === 'PAYPAL' && hasSavedPaypalMethods && activeWallet !== 'PAYPAL') {
+            toast.error('Select PayPal under saved payment methods to pay with PayPal.');
             return;
         }
+
+        if (provider === 'PAYPAL' && paypalPaySource === 'saved' && !String(selectedPaypalVaultId || '').trim()) {
+            toast.error('No saved PayPal account. Add one under Saved payments.');
+            return;
+        }
+
+        const hasSavedStripeMethods = savedPaymentMethods.some(
+            (m) => m.provider === 'STRIPE' && String(m.stripePaymentMethodId || '').trim(),
+        );
+        if (provider === 'STRIPE' && !useManualStripe && hasSavedStripeMethods && activeWallet !== 'STRIPE') {
+            toast.error('Select a card option under saved payment methods to pay with Stripe.');
+            return;
+        }
+
+        const paypalUrls = paypalCheckoutReturnUrls();
+        const paypalVaultExtra =
+            provider === 'PAYPAL' &&
+            paypalPaySource === 'saved' &&
+            String(selectedPaypalVaultId || '').trim()
+                ? { paypalVaultId: String(selectedPaypalVaultId).trim() }
+                : {};
+
         onBusyChange(true);
         try {
+            const codesPayload =
+                couponCodes.length > 0 ? { couponCodes: normalizeCouponCodes(couponCodes) } : {};
             let body;
-            if (provider === 'STRIPE') {
-                body = { provider, paymentMethodId: paymentMethodId.trim() };
+            if (checkoutMode === 'batch') {
+                body = {
+                    shipInIds: batchContext.shipInIds,
+                    addressId: batchContext.addressId,
+                    carrierName: batchContext.carrierName,
+                    ...(batchContext.carrierService ? { carrierService: batchContext.carrierService } : {}),
+                    ...(batchContext.addonServices ? { addonServices: batchContext.addonServices } : {}),
+                    provider,
+                    ...(provider === 'STRIPE'
+                        ? { paymentMethodId: effectiveStripePm }
+                        : { ...paypalUrls, ...paypalVaultExtra }),
+                    ...codesPayload,
+                };
+            } else if (provider === 'STRIPE') {
+                body = { provider, paymentMethodId: effectiveStripePm, ...codesPayload };
             } else {
                 const { currency: ccRaw, amount: amt } = resolveCheckoutMoney(lockedCarrierOption, summary);
                 const cc = String(ccRaw ?? '').trim().toUpperCase();
                 const hasAmount = amt != null && amt !== '';
                 body = {
                     provider,
-                    ...paypalReturnUrls(),
-                    /** Single-ship checkout only — batch PayPal uses server-stored amount from `POST .../rate`. */
-                    ...(checkoutMode === 'shipin'
-                        ? {
-                              ...(cc ? { currencyCode: cc } : {}),
-                              ...(hasAmount ? { amount: amt } : {}),
-                          }
-                        : {}),
+                    ...paypalUrls,
+                    ...paypalVaultExtra,
+                    ...codesPayload,
+                    ...(cc ? { currencyCode: cc } : {}),
+                    ...(hasAmount ? { amount: amt } : {}),
                 };
             }
             const res = await api.post(payPath, body);
@@ -207,8 +434,34 @@ export default function CheckoutPaymentPanel({
                 }
             }
 
-            const status = res?.data?.data?.status;
-            toast.success(status === 'succeeded' ? 'Payment successful' : 'Payment submitted');
+            const payRoot = res?.data;
+            const payStatus = payRoot?.data?.status ?? payRoot?.status;
+            const stripeChargeSucceeded =
+                provider === 'STRIPE' && String(payStatus ?? '').toLowerCase() === 'succeeded';
+
+            toast.success(stripeChargeSucceeded ? 'Payment successful' : 'Payment submitted');
+
+            if (
+                provider === 'STRIPE' &&
+                saveForFuture &&
+                stripeChargeSucceeded &&
+                !useManualStripe &&
+                stripePaySource === 'new'
+            ) {
+                try {
+                    await attachPaymentMethod(effectiveStripePm);
+                    toast.success('Card saved for future checkout.');
+                    const list = await listPaymentMethods();
+                    setSavedPaymentMethods(Array.isArray(list) ? list : []);
+                    setSaveNewCardAfterPay(false);
+                } catch (attachErr) {
+                    toast.error(
+                        attachErr?.response?.data?.error ||
+                            'Payment succeeded, but this card could not be saved for later.',
+                    );
+                }
+            }
+
             await onPaidSuccess?.();
         } catch (err) {
             toast.error(err?.response?.data?.error || 'Payment failed');
@@ -218,6 +471,15 @@ export default function CheckoutPaymentPanel({
         }
     };
 
+    const stripeSavedRows = savedPaymentMethods.filter(
+        (m) => m.provider === 'STRIPE' && String(m.stripePaymentMethodId || '').trim(),
+    );
+    const paypalSavedRows = savedPaymentMethods.filter(
+        (m) => m.provider === 'PAYPAL' && String(m.paypalVaultId || '').trim(),
+    );
+    /** When saved PayPal methods exist, the yellow button only runs PayPal if that rail is selected. */
+    const payPalCtaRequiresWalletSelection = paypalSavedRows.length > 0;
+
     return (
         <div className="space-y-5 border border-slate-200 rounded-xl bg-slate-50/50 p-5">
             <div>
@@ -225,18 +487,77 @@ export default function CheckoutPaymentPanel({
                 <p className="mt-1 text-xs text-slate-500">
                     {checkoutMode === 'batch' ? (
                         <>
-                            Consolidated batch <code className="rounded bg-slate-100 px-1">{batchId}</code>
+                            Consolidated batch ({batchContext?.shipInIds?.length ?? 0} shipments)
                         </>
                     ) : (
                         <>Single shipment checkout</>
                     )}
                 </p>
-                <p className="mt-1 text-sm text-slate-600">
-                    Amount due:{' '}
-                    <span className="font-semibold text-slate-900">
-                        {payAmount ?? summary?.finalAmount} {payCurrency || summary?.currency || '—'}
-                    </span>
-                </p>
+                {summary &&
+                    summary.productAmount != null &&
+                    summary.shippingAmount != null &&
+                    summary.addOnAmount != null && (
+                        <div className="mt-3 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700">
+                            <p className="mb-2 font-semibold text-slate-900">Order summary</p>
+                            <dl className="space-y-1">
+                                <div className="flex justify-between gap-4">
+                                    <dt>Products</dt>
+                                    <dd className="font-medium tabular-nums">
+                                        {summary.productAmount} {payCurrency || summary.currency || ''}
+                                    </dd>
+                                </div>
+                                <div className="flex justify-between gap-4">
+                                    <dt>Shipping</dt>
+                                    <dd className="font-medium tabular-nums">
+                                        {summary.shippingAmount} {payCurrency || summary.currency || ''}
+                                    </dd>
+                                </div>
+                                <div className="flex justify-between gap-4">
+                                    <dt>Add-ons</dt>
+                                    <dd className="font-medium tabular-nums">
+                                        {summary.addOnAmount} {payCurrency || summary.currency || ''}
+                                    </dd>
+                                </div>
+                                <div className="flex justify-between gap-4 border-t border-slate-100 pt-1 text-slate-600">
+                                    <dt>Subtotal</dt>
+                                    <dd className="tabular-nums">
+                                        {summary.finalAmount} {payCurrency || summary.currency || ''}
+                                    </dd>
+                                </div>
+                                {couponPricing &&
+                                    couponPricing.discountTotal != null &&
+                                    Number(couponPricing.discountTotal) > 0 && (
+                                        <div className="flex justify-between gap-4 text-emerald-800">
+                                            <dt>Coupon discount</dt>
+                                            <dd className="font-semibold tabular-nums">
+                                                −{couponPricing.discountTotal}{' '}
+                                                {payCurrency || summary.currency || ''}
+                                            </dd>
+                                        </div>
+                                    )}
+                                <div className="flex justify-between gap-4 border-t border-slate-200 pt-1 font-semibold text-slate-900">
+                                    <dt>Amount due</dt>
+                                    <dd className="tabular-nums">
+                                        {payAmount ?? summary.finalAmount}{' '}
+                                        {payCurrency || summary.currency || '—'}
+                                    </dd>
+                                </div>
+                            </dl>
+                        </div>
+                    )}
+                {!(
+                    summary &&
+                    summary.productAmount != null &&
+                    summary.shippingAmount != null &&
+                    summary.addOnAmount != null
+                ) && (
+                    <p className="mt-1 text-sm text-slate-600">
+                        Amount due:{' '}
+                        <span className="font-semibold text-slate-900">
+                            {payAmount ?? summary?.finalAmount} {payCurrency || summary?.currency || '—'}
+                        </span>
+                    </p>
+                )}
                 {currencyMismatch && (
                     <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950">
                         Summary says <strong>{fromSummary}</strong> but your locked carrier is <strong>{fromLocked}</strong>.
@@ -246,16 +567,278 @@ export default function CheckoutPaymentPanel({
                 )}
             </div>
 
-            {stripePromise && !useManualStripe && (
+            <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+                <div className="mb-3 flex items-center gap-2">
+                    <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-800 text-white">
+                        <Tag className="h-4 w-4" />
+                    </div>
+                    <div>
+                        <h4 className="text-sm font-semibold text-slate-900">Coupon codes</h4>
+                        <p className="text-xs text-slate-500">
+                            {checkoutMode === 'batch'
+                                ? 'Up to 8 codes; order matters for stacking. Preview matches what you pay.'
+                                : 'Applied on the server — totals update below when valid.'}
+                        </p>
+                    </div>
+                </div>
+                <div className="flex flex-col gap-2 sm:flex-row">
+                    <input
+                        value={couponDraft}
+                        onChange={(e) => setCouponDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                                e.preventDefault();
+                                void addCouponFromDraft();
+                            }
+                        }}
+                        placeholder="Enter code"
+                        disabled={disabled || busy || couponBusy || couponCodes.length >= MAX_COUPONS}
+                        className="min-w-0 flex-1 rounded-lg border border-slate-200 px-3 py-2 text-sm uppercase placeholder:normal-case"
+                    />
+                    <button
+                        type="button"
+                        disabled={
+                            disabled ||
+                            busy ||
+                            couponBusy ||
+                            !couponDraft.trim() ||
+                            couponCodes.length >= MAX_COUPONS
+                        }
+                        onClick={() => void addCouponFromDraft()}
+                        className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                        {couponBusy ? 'Applying…' : 'Apply'}
+                    </button>
+                </div>
+                {couponCodes.length > 0 && (
+                    <ul className="mt-3 flex flex-wrap gap-2">
+                        {couponCodes.map((c) => (
+                            <li
+                                key={c}
+                                className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-800"
+                            >
+                                {c}
+                                <button
+                                    type="button"
+                                    disabled={disabled || busy || couponBusy}
+                                    onClick={() => void removeCouponCode(c)}
+                                    className="rounded-full p-0.5 text-slate-500 hover:bg-slate-200 hover:text-slate-900 disabled:opacity-50"
+                                    aria-label={`Remove ${c}`}
+                                >
+                                    <X className="h-3.5 w-3.5" />
+                                </button>
+                            </li>
+                        ))}
+                    </ul>
+                )}
+                {couponCodes.length > 0 && (
+                    <button
+                        type="button"
+                        disabled={disabled || busy || couponBusy}
+                        onClick={() => void clearAllCoupons()}
+                        className="mt-2 text-xs font-medium text-slate-600 underline-offset-2 hover:text-slate-900 hover:underline"
+                    >
+                        Remove all coupons
+                    </button>
+                )}
+            </div>
+
+            {stripeSavedRows.length + paypalSavedRows.length > 0 && (
+                    <div className="rounded-xl border border-indigo-100 bg-indigo-50/30 p-4 shadow-sm">
+                        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                            <h4 className="text-sm font-semibold text-slate-900">Use a saved payment method</h4>
+                            <Link
+                                to="/settings/payment"
+                                className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
+                            >
+                                Manage saved payments
+                            </Link>
+                        </div>
+                        {stripeSavedRows.length > 0 && !useManualStripe && (
+                            <fieldset className="mb-4 space-y-2">
+                                <legend className="text-xs font-medium text-slate-600">Card (Stripe)</legend>
+                                <label className="flex cursor-pointer items-center gap-2 text-sm">
+                                    <input
+                                        type="radio"
+                                        name="checkout-pay-rail"
+                                        checked={activeWallet === 'STRIPE' && stripePaySource === 'saved'}
+                                        onChange={() => {
+                                            setActiveWallet('STRIPE');
+                                            setStripePaySource('saved');
+                                            setSaveNewCardAfterPay(false);
+                                        }}
+                                        disabled={disabled || busy}
+                                    />
+                                    <span>Saved card</span>
+                                </label>
+                                {activeWallet === 'STRIPE' && stripePaySource === 'saved' && (
+                                    <div className="ml-6 space-y-1 border-l border-slate-200 pl-3">
+                                        {stripeSavedRows.map((m) => (
+                                            <label
+                                                key={m.id}
+                                                className="flex cursor-pointer items-center gap-2 text-sm text-slate-800"
+                                            >
+                                                <input
+                                                    type="radio"
+                                                    name="stripeSavedPm"
+                                                    checked={selectedStripePmId === m.stripePaymentMethodId}
+                                                    onChange={() => {
+                                                        setActiveWallet('STRIPE');
+                                                        setStripePaySource('saved');
+                                                        setSelectedStripePmId(String(m.stripePaymentMethodId));
+                                                        setSaveNewCardAfterPay(false);
+                                                    }}
+                                                    disabled={disabled || busy}
+                                                />
+                                                <span>
+                                                    {(m.brand || 'Card').toString()} •••• {m.last4 || '????'}
+                                                    {m.expMonth && m.expYear
+                                                        ? ` · ${m.expMonth}/${m.expYear}`
+                                                        : ''}
+                                                    {m.isDefault ? ' · default' : ''}
+                                                </span>
+                                            </label>
+                                        ))}
+                                    </div>
+                                )}
+                                <label className="flex cursor-pointer items-center gap-2 text-sm">
+                                    <input
+                                        type="radio"
+                                        name="checkout-pay-rail"
+                                        checked={activeWallet === 'STRIPE' && stripePaySource === 'new'}
+                                        onChange={() => {
+                                            setActiveWallet('STRIPE');
+                                            setStripePaySource('new');
+                                        }}
+                                        disabled={disabled || busy}
+                                    />
+                                    <span>New card (form below)</span>
+                                </label>
+                            </fieldset>
+                        )}
+                        {paypalSavedRows.length > 0 && (
+                            <fieldset className="space-y-2">
+                                <legend className="text-xs font-medium text-slate-600">PayPal</legend>
+                                <label className="flex cursor-pointer items-center gap-2 text-sm">
+                                    <input
+                                        type="radio"
+                                        name="checkout-pay-rail"
+                                        checked={activeWallet === 'PAYPAL' && paypalPaySource === 'saved'}
+                                        onChange={() => {
+                                            setActiveWallet('PAYPAL');
+                                            setPaypalPaySource('saved');
+                                        }}
+                                        disabled={disabled || busy}
+                                    />
+                                    <span>Saved PayPal</span>
+                                </label>
+                                {activeWallet === 'PAYPAL' && paypalPaySource === 'saved' && (
+                                    <div className="ml-6 space-y-1 border-l border-slate-200 pl-3">
+                                        {paypalSavedRows.map((m) => (
+                                            <label
+                                                key={m.id}
+                                                className="flex cursor-pointer items-center gap-2 text-sm text-slate-800"
+                                            >
+                                                <input
+                                                    type="radio"
+                                                    name="paypalVaultPick"
+                                                    checked={selectedPaypalVaultId === m.paypalVaultId}
+                                                    onChange={() => {
+                                                        setActiveWallet('PAYPAL');
+                                                        setPaypalPaySource('saved');
+                                                        setSelectedPaypalVaultId(String(m.paypalVaultId));
+                                                    }}
+                                                    disabled={disabled || busy}
+                                                />
+                                                <span>
+                                                    {m.paypalEmail
+                                                        ? String(m.paypalEmail)
+                                                        : `Vault ${String(m.paypalVaultId).slice(0, 8)}…`}
+                                                    {m.isDefault ? ' · default' : ''}
+                                                </span>
+                                            </label>
+                                        ))}
+                                    </div>
+                                )}
+                                <label className="flex cursor-pointer items-center gap-2 text-sm">
+                                    <input
+                                        type="radio"
+                                        name="checkout-pay-rail"
+                                        checked={activeWallet === 'PAYPAL' && paypalPaySource === 'redirect'}
+                                        onChange={() => {
+                                            setActiveWallet('PAYPAL');
+                                            setPaypalPaySource('redirect');
+                                        }}
+                                        disabled={disabled || busy}
+                                    />
+                                    <span>Log in with PayPal each time</span>
+                                </label>
+                            </fieldset>
+                        )}
+                    </div>
+                )}
+
+            {stripePromise && !useManualStripe && activeWallet === 'STRIPE' && stripePaySource === 'new' && (
                 <Elements stripe={stripePromise}>
-                    <StripePayForm disabled={disabled} busy={busy} onPay={completePay} />
+                    <StripePayForm
+                        disabled={disabled}
+                        busy={busy}
+                        onPay={completePay}
+                        saveForFuture={saveNewCardAfterPay}
+                        onSaveForFutureChange={setSaveNewCardAfterPay}
+                    />
                 </Elements>
+            )}
+
+            {stripePromise &&
+                !useManualStripe &&
+                activeWallet === 'STRIPE' &&
+                stripePaySource === 'new' &&
+                publishableKey.startsWith('pk_test') && (
+                    <div className="rounded-lg border border-dashed border-violet-200 bg-violet-50/70 px-3 py-2 text-xs text-slate-700">
+                        <p className="font-semibold text-slate-800">Stripe test cards</p>
+                        <ul className="mt-1 list-disc space-y-1 pl-4">
+                            <li>
+                                <span className="font-mono">4242 4242 4242 4242</span> (Visa) — use any 3-digit CVC and
+                                any <strong>future</strong> expiry (e.g. 12/34).
+                            </li>
+                            <li>
+                                <span className="font-mono">5555 5555 5555 4444</span> (Mastercard) — any CVC, any
+                                future expiry.
+                            </li>
+                        </ul>
+                        <p className="mt-2 text-slate-600">
+                            Type a fresh card in the field each time. Reusing an old{' '}
+                            <code className="rounded bg-white/90 px-0.5 font-mono text-[11px]">pm_…</code> id usually
+                            fails after the first charge.
+                        </p>
+                    </div>
+                )}
+
+            {!useManualStripe && activeWallet === 'STRIPE' && stripePaySource === 'saved' && selectedStripePmId && (
+                <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+                    <p className="text-sm text-slate-700">Pay with your saved card on file.</p>
+                    <button
+                        type="button"
+                        disabled={disabled || busy}
+                        onClick={() => void completePay({ provider: 'STRIPE', paymentMethodId: selectedStripePmId })}
+                        className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-[#635BFF] px-4 py-3 text-sm font-semibold text-white shadow-sm hover:bg-[#544bdb] disabled:opacity-50"
+                    >
+                        <Lock className="h-4 w-4 opacity-90" />
+                        {busy ? 'Processing…' : 'Pay with saved card'}
+                    </button>
+                </div>
             )}
 
             {stripePromise && (
                 <button
                     type="button"
-                    onClick={() => setUseManualStripe((v) => !v)}
+                    onClick={() => {
+                        setUseManualStripe((v) => {
+                            if (!v) setActiveWallet('STRIPE');
+                            return !v;
+                        });
+                    }}
                     className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
                 >
                     {useManualStripe ? '← Use Stripe card form' : 'Use payment method id (advanced)'}
@@ -297,7 +880,11 @@ export default function CheckoutPaymentPanel({
                 <div className="mb-3 space-y-2 text-xs text-slate-600">
                     <div className="flex items-start gap-2">
                         <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-400" />
-                        <p>Continue to PayPal to log in and approve this payment in your PayPal account.</p>
+                        <p>
+                            {activeWallet === 'PAYPAL' && paypalPaySource === 'saved'
+                                ? 'Pay with your saved PayPal vault (you may still confirm in PayPal if prompted).'
+                                : 'Continue to PayPal to log in and approve this payment in your PayPal account.'}
+                        </p>
                     </div>
                     {payCurrency && checkoutMode === 'shipin' && (
                         <p className="pl-5 text-slate-500">
@@ -310,15 +897,20 @@ export default function CheckoutPaymentPanel({
                     )}
                     {checkoutMode === 'batch' && (
                         <p className="pl-5 text-slate-500">
-                            Batch PayPal orders use the amount from <strong>POST /customer/batches/:id/rate</strong> on the
-                            server (no extra fields required here).
+                            PayPal uses the priced batch total on the server (including any coupon discount when codes are
+                            sent with pay).
                         </p>
                     )}
                 </div>
                 <button
                     type="button"
-                    disabled={disabled || busy}
-                    onClick={() => completePay({ provider: 'PAYPAL' })}
+                    disabled={disabled || busy || (payPalCtaRequiresWalletSelection && activeWallet !== 'PAYPAL')}
+                    title={
+                        payPalCtaRequiresWalletSelection && activeWallet !== 'PAYPAL'
+                            ? 'Choose a PayPal option under saved payment methods above'
+                            : undefined
+                    }
+                    onClick={() => void completePay({ provider: 'PAYPAL' })}
                     className="flex w-full items-center justify-center gap-2 rounded-lg border-2 border-[#0070ba] bg-[#ffc439] px-4 py-3 text-[15px] font-bold tracking-tight text-[#003087] shadow-sm transition hover:bg-[#f2b635] disabled:cursor-not-allowed disabled:opacity-50"
                 >
                     {busy ? (
@@ -326,7 +918,9 @@ export default function CheckoutPaymentPanel({
                     ) : (
                         <>
                             <PayPalIcon className="h-6 w-6 shrink-0" />
-                            Pay with PayPal
+                            {activeWallet === 'PAYPAL' && paypalPaySource === 'saved'
+                                ? 'Pay with saved PayPal'
+                                : 'Pay with PayPal'}
                         </>
                     )}
                 </button>

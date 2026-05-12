@@ -23,9 +23,7 @@ const Dashboard = () => {
     const [serviceRows, setServiceRows] = useState([{ code: '', label: '', amount: '' }]);
     const [summary, setSummary] = useState(null);
 
-    /** Batch checkout — auto-created when 2+ shipments selected */
-    const [batchId, setBatchId] = useState(null);
-    const [batchSelectionKey, setBatchSelectionKey] = useState('');
+    /** Batch checkout — stateless (no server-side batch until payment succeeds) */
     const [batchRatesData, setBatchRatesData] = useState(null);
     const [batchSelectedService, setBatchSelectedService] = useState('');
     const [batchPriceSummary, setBatchPriceSummary] = useState(null);
@@ -164,24 +162,16 @@ const Dashboard = () => {
     }, [user]);
 
     const clearBatchCheckout = () => {
-        setBatchId(null);
-        setBatchSelectionKey('');
         setBatchRatesData(null);
         setBatchSelectedService('');
         setBatchPriceSummary(null);
         setBatchSummaryView(null);
     };
 
-    /** When selection is no longer 2+ identical set, drop batch client state */
+    /** When selection changes or drops below 2, clear stale batch checkout data */
     useEffect(() => {
-        if (!isMultiCheckout) {
-            clearBatchCheckout();
-            return;
-        }
-        if (batchId && batchSelectionKey && batchSelectionKey !== selectionKey) {
-            clearBatchCheckout();
-        }
-    }, [isMultiCheckout, selectionKey, batchId, batchSelectionKey]);
+        clearBatchCheckout();
+    }, [isMultiCheckout, selectionKey]);
 
     useEffect(() => {
         if (isMultiCheckout) return;
@@ -205,42 +195,17 @@ const Dashboard = () => {
         }
     };
 
-    /**
-     * Ensures a ShipmentBatch exists for the current checkbox selection.
-     * POST /customer/batches — required so Payment.batchId is set on pay.
-     */
-    const ensureBatchForCurrentSelection = async () => {
-        if (selectedIds.length < 2) return null;
-        if (batchId && batchSelectionKey === selectionKey) return batchId;
-        const res = await api.post('/customer/batches', { shipInIds: selectedIds });
-        const id = res?.data?.data?.batchId;
-        if (!id) throw new Error('No batchId in response');
-        setBatchId(id);
-        setBatchSelectionKey(selectionKey);
-        setBatchRatesData(null);
-        setBatchSelectedService('');
-        setBatchPriceSummary(null);
-        setBatchSummaryView(null);
-        return id;
-    };
-
-    const postBatchConfigure = async ({ carrierName, carrierService, batchIdOverride }) => {
-        const id = batchIdOverride ?? batchId ?? (await ensureBatchForCurrentSelection());
-        if (!id) throw new Error('No batch');
+    /** Stateless batch rate — sends all context in the body, no server-side batch yet. */
+    const runBatchRate = async ({ carrierName, carrierService } = {}) => {
+        if (selectedIds.length < 2) throw new Error('Select at least 2 shipments');
         if (!addressId.trim()) throw new Error('Select a shipping address');
-        await api.post(`/customer/batches/${id}/configure`, {
+        const res = await api.post('/customer/batches/rate', {
+            shipInIds: selectedIds,
             addressId: addressId.trim(),
-            carrierName: carrierName || 'Consolidated',
-            addonServices: addonServicesPayload(),
+            carrierName: carrierName || 'Quote',
             ...(carrierService ? { carrierService } : {}),
+            addonServices: addonServicesPayload(),
         });
-        return id;
-    };
-
-    const runBatchRate = async (batchIdOverride) => {
-        const id = batchIdOverride ?? batchId ?? (await ensureBatchForCurrentSelection());
-        if (!addressId.trim()) throw new Error('Select a shipping address');
-        const res = await api.post(`/customer/batches/${id}/rate`, {});
         const data = res?.data?.data || {};
         setBatchRatesData(data.rates || null);
         setBatchPriceSummary(data.summary || null);
@@ -253,9 +218,7 @@ const Dashboard = () => {
         if (isMultiCheckout) {
             setCheckoutLoading(true);
             try {
-                const id = await ensureBatchForCurrentSelection();
-                await postBatchConfigure({ carrierName: 'Quote', carrierService: '', batchIdOverride: id });
-                await runBatchRate(id);
+                await runBatchRate({ carrierName: 'Quote' });
                 toast.success('Batch rates loaded (one payment for all selected shipments)');
             } catch (err) {
                 toast.error(err?.response?.data?.error || err.message || 'Failed to fetch batch rates');
@@ -283,14 +246,11 @@ const Dashboard = () => {
         if (isMultiCheckout) {
             setCheckoutLoading(true);
             try {
-                const id = await ensureBatchForCurrentSelection();
                 const opt = batchRatesData?.options?.find((o) => o.service === batchSelectedService);
-                await postBatchConfigure({
+                await runBatchRate({
                     carrierName: String(opt?.name || 'Selected carrier'),
                     carrierService: batchSelectedService,
-                    batchIdOverride: id,
                 });
-                await runBatchRate(id);
                 toast.success('Carrier locked for batch');
             } catch (err) {
                 toast.error(err?.response?.data?.error || err.message || 'Failed to lock batch carrier');
@@ -319,14 +279,11 @@ const Dashboard = () => {
         if (isMultiCheckout) {
             setCheckoutLoading(true);
             try {
-                const id = await ensureBatchForCurrentSelection();
                 const opt = batchRatesData?.options?.find((o) => o.service === batchSelectedService);
-                await postBatchConfigure({
+                await runBatchRate({
                     carrierName: String(opt?.name || 'Consolidated'),
                     carrierService: batchSelectedService || '',
-                    batchIdOverride: id,
                 });
-                await runBatchRate(id);
                 toast.success('Batch add-ons saved and price updated');
             } catch (err) {
                 toast.error(err?.response?.data?.error || err.message || 'Failed to update batch services');
@@ -354,8 +311,7 @@ const Dashboard = () => {
         if (isMultiCheckout) {
             setCheckoutLoading(true);
             try {
-                const id = await ensureBatchForCurrentSelection();
-                const res = await api.get(`/customer/batches/${id}/summary`);
+                const res = await api.post('/customer/batches/summary', { shipInIds: selectedIds });
                 setBatchSummaryView(res?.data?.data || null);
                 toast.success('Batch summary loaded');
             } catch (err) {
@@ -385,6 +341,36 @@ const Dashboard = () => {
         setSummary(null);
         setRatesData(null);
         clearBatchCheckout();
+    };
+
+    /** Merge `POST .../coupons` preview into single-shipment checkout summary for totals / chips. */
+    const mergeShipInCouponPatch = (patch) => {
+        if (!patch || typeof patch !== 'object') return;
+        setSummary((prev) => {
+            const base = prev || {};
+            const couponPricing = patch.couponPricing ?? patch.pricing ?? base.couponPricing ?? null;
+            return {
+                ...base,
+                ...patch,
+                couponPricing,
+                couponCodes: patch.couponCodes ?? base.couponCodes,
+            };
+        });
+    };
+
+    /** Merge `POST .../batches/:id/coupons/preview` into consolidated checkout totals / chips. */
+    const mergeBatchCouponPatch = (patch) => {
+        if (!patch || typeof patch !== 'object') return;
+        setBatchPriceSummary((prev) => {
+            const base = prev || {};
+            const couponPricing = patch.couponPricing ?? patch.pricing ?? null;
+            return {
+                ...base,
+                ...patch,
+                couponPricing,
+                couponCodes: Array.isArray(patch.couponCodes) ? patch.couponCodes : [],
+            };
+        });
     };
 
     const ratesButtonDisabled =
@@ -463,15 +449,10 @@ const Dashboard = () => {
                     <div className="p-6 space-y-5">
                         {isMultiCheckout && (
                             <div className="rounded-lg border border-violet-200 bg-violet-50 px-4 py-3 text-sm text-violet-950">
-                                <strong>{selectedIds.length} shipments selected</strong> — checkout uses{' '}
-                                <code className="rounded bg-white px-1 text-xs">POST /api/customer/batches</code>
-                                {' '}so you get <strong>one</strong> payment and <strong>one</strong> ShipOut. Use Get
-                                Rates → Lock Carrier → Pay (same buttons as single shipment).
-                                {batchId && (
-                                    <span className="block mt-1 text-xs opacity-90">
-                                        Active batch: {batchId}
-                                    </span>
-                                )}
+                                <strong>{selectedIds.length} shipments selected</strong> — checkout uses a{' '}
+                                <strong>stateless</strong> batch flow so you get <strong>one</strong> payment and{' '}
+                                <strong>one</strong> ShipOut. Use Get Rates → Lock Carrier → Pay (same buttons as
+                                single shipment).
                             </div>
                         )}
 
@@ -670,21 +651,30 @@ const Dashboard = () => {
                             </div>
                         )}
 
-                        {isMultiCheckout && batchId && batchPriceSummary && (
+                        {isMultiCheckout && batchPriceSummary && (
                             <CheckoutPaymentPanel
+                                key={`batch-checkout-${selectionKey}`}
                                 checkoutMode="batch"
-                                batchId={batchId}
+                                batchContext={{
+                                    shipInIds: selectedIds,
+                                    addressId: addressId.trim(),
+                                    carrierName: lockedCarrierOption?.name || batchSelectedService || 'Selected carrier',
+                                    carrierService: batchSelectedService || undefined,
+                                    addonServices: addonServicesPayload(),
+                                }}
                                 summary={batchPriceSummary}
                                 lockedCarrierOption={lockedCarrierOption}
                                 disabled={checkoutLoading}
                                 busy={checkoutLoading}
                                 onBusyChange={setCheckoutLoading}
                                 onPaidSuccess={handleCheckoutPaidSuccess}
+                                onBatchPriceSummaryPatch={mergeBatchCouponPatch}
                             />
                         )}
 
                         {!isMultiCheckout && summary && activeShipment && (
                             <CheckoutPaymentPanel
+                                key={`shipin-checkout-${activeShipment.id}`}
                                 checkoutMode="shipin"
                                 shipmentId={activeShipment.id}
                                 summary={summary}
@@ -693,6 +683,7 @@ const Dashboard = () => {
                                 busy={checkoutLoading}
                                 onBusyChange={setCheckoutLoading}
                                 onPaidSuccess={handleCheckoutPaidSuccess}
+                                onCheckoutSummaryPatch={mergeShipInCouponPatch}
                             />
                         )}
                     </div>
