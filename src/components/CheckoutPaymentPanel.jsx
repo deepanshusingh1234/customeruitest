@@ -297,9 +297,9 @@ export default function CheckoutPaymentPanel({
             const data = res?.data?.data;
             const patch = data
                 ? {
-                      ...data,
-                      couponPricing: data.couponPricing ?? data.pricing ?? null,
-                  }
+                    ...data,
+                    couponPricing: data.couponPricing ?? data.pricing ?? null,
+                }
                 : null;
             onCheckoutSummaryPatch?.(patch);
             toast.success(!codes.length ? 'Coupons cleared' : 'Coupons updated');
@@ -325,10 +325,10 @@ export default function CheckoutPaymentPanel({
             const data = res?.data?.data;
             const patch = data
                 ? {
-                      ...data,
-                      couponPricing: data.couponPricing ?? data.pricing ?? null,
-                      couponCodes: Array.isArray(data.couponCodes) ? normalizeCouponCodes(data.couponCodes) : [],
-                  }
+                    ...data,
+                    couponPricing: data.couponPricing ?? data.pricing ?? null,
+                    couponCodes: Array.isArray(data.couponCodes) ? normalizeCouponCodes(data.couponCodes) : [],
+                }
                 : null;
             onBatchPriceSummaryPatch?.(patch);
             toast.success(!codes.length ? 'Coupons cleared' : 'Coupons updated');
@@ -420,8 +420,8 @@ export default function CheckoutPaymentPanel({
         const paypalUrls = paypalCheckoutReturnUrls();
         const paypalVaultExtra =
             provider === 'PAYPAL' &&
-            paypalPaySource === 'saved' &&
-            String(selectedPaypalVaultId || '').trim()
+                paypalPaySource === 'saved' &&
+                String(selectedPaypalVaultId || '').trim()
                 ? { paypalVaultId: String(selectedPaypalVaultId).trim() }
                 : {};
 
@@ -488,11 +488,11 @@ export default function CheckoutPaymentPanel({
                         } catch (captureErr) {
                             toast.error(
                                 captureErr?.response?.data?.error ||
-                                    (typeof captureErr?.response?.data === 'string'
-                                        ? captureErr.response.data
-                                        : null) ||
-                                    captureErr?.message ||
-                                    'Could not capture PayPal payment.',
+                                (typeof captureErr?.response?.data === 'string'
+                                    ? captureErr.response.data
+                                    : null) ||
+                                captureErr?.message ||
+                                'Could not capture PayPal payment.',
                             );
                             window.dispatchEvent(new Event('customer-notification:new'));
                             return;
@@ -544,7 +544,7 @@ export default function CheckoutPaymentPanel({
                 } catch (attachErr) {
                     toast.error(
                         attachErr?.response?.data?.error ||
-                            'Payment succeeded, but this card could not be saved for later.',
+                        'Payment succeeded, but this card could not be saved for later.',
                     );
                 }
             }
@@ -649,13 +649,13 @@ export default function CheckoutPaymentPanel({
                     summary.shippingAmount != null &&
                     summary.addOnAmount != null
                 ) && (
-                    <p className="mt-1 text-sm text-slate-600">
-                        Amount due:{' '}
-                        <span className="font-semibold text-slate-900">
-                            {payAmount ?? summary?.finalAmount} {payCurrency || summary?.currency || '—'}
-                        </span>
-                    </p>
-                )}
+                        <p className="mt-1 text-sm text-slate-600">
+                            Amount due:{' '}
+                            <span className="font-semibold text-slate-900">
+                                {payAmount ?? summary?.finalAmount} {payCurrency || summary?.currency || '—'}
+                            </span>
+                        </p>
+                    )}
                 {currencyMismatch && (
                     <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950">
                         Summary says <strong>{fromSummary}</strong> but your locked carrier is <strong>{fromLocked}</strong>.
@@ -742,139 +742,139 @@ export default function CheckoutPaymentPanel({
             </div>
 
             {stripeSavedRows.length + paypalSavedRows.length > 0 && (
-                    <div className="rounded-xl border border-indigo-100 bg-indigo-50/30 p-4 shadow-sm">
-                        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                            <h4 className="text-sm font-semibold text-slate-900">Use a saved payment method</h4>
-                            <Link
-                                to="/settings/payment"
-                                className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
-                            >
-                                Manage saved payments
-                            </Link>
-                        </div>
-                        {stripeSavedRows.length > 0 && !useManualStripe && (
-                            <fieldset className="mb-4 space-y-2">
-                                <legend className="text-xs font-medium text-slate-600">Card (Stripe)</legend>
-                                <label className="flex cursor-pointer items-center gap-2 text-sm">
-                                    <input
-                                        type="radio"
-                                        name="checkout-pay-rail"
-                                        checked={activeWallet === 'STRIPE' && stripePaySource === 'saved'}
-                                        onChange={() => {
-                                            setActiveWallet('STRIPE');
-                                            setStripePaySource('saved');
-                                            setSaveNewCardAfterPay(false);
-                                        }}
-                                        disabled={disabled || busy}
-                                    />
-                                    <span>Saved card</span>
-                                </label>
-                                {activeWallet === 'STRIPE' && stripePaySource === 'saved' && (
-                                    <div className="ml-6 space-y-1 border-l border-slate-200 pl-3">
-                                        {stripeSavedRows.map((m) => (
-                                            <label
-                                                key={m.id}
-                                                className="flex cursor-pointer items-center gap-2 text-sm text-slate-800"
-                                            >
-                                                <input
-                                                    type="radio"
-                                                    name="stripeSavedPm"
-                                                    checked={selectedStripePmId === m.stripePaymentMethodId}
-                                                    onChange={() => {
-                                                        setActiveWallet('STRIPE');
-                                                        setStripePaySource('saved');
-                                                        setSelectedStripePmId(String(m.stripePaymentMethodId));
-                                                        setSaveNewCardAfterPay(false);
-                                                    }}
-                                                    disabled={disabled || busy}
-                                                />
-                                                <span>
-                                                    {(m.brand || 'Card').toString()} •••• {m.last4 || '????'}
-                                                    {m.expMonth && m.expYear
-                                                        ? ` · ${m.expMonth}/${m.expYear}`
-                                                        : ''}
-                                                    {m.isDefault ? ' · default' : ''}
-                                                </span>
-                                            </label>
-                                        ))}
-                                    </div>
-                                )}
-                                <label className="flex cursor-pointer items-center gap-2 text-sm">
-                                    <input
-                                        type="radio"
-                                        name="checkout-pay-rail"
-                                        checked={activeWallet === 'STRIPE' && stripePaySource === 'new'}
-                                        onChange={() => {
-                                            setActiveWallet('STRIPE');
-                                            setStripePaySource('new');
-                                        }}
-                                        disabled={disabled || busy}
-                                    />
-                                    <span>New card (form below)</span>
-                                </label>
-                            </fieldset>
-                        )}
-                        {paypalSavedRows.length > 0 && (
-                            <fieldset className="space-y-2">
-                                <legend className="text-xs font-medium text-slate-600">PayPal</legend>
-                                <label className="flex cursor-pointer items-center gap-2 text-sm">
-                                    <input
-                                        type="radio"
-                                        name="checkout-pay-rail"
-                                        checked={activeWallet === 'PAYPAL' && paypalPaySource === 'saved'}
-                                        onChange={() => {
-                                            setActiveWallet('PAYPAL');
-                                            setPaypalPaySource('saved');
-                                        }}
-                                        disabled={disabled || busy}
-                                    />
-                                    <span>Saved PayPal</span>
-                                </label>
-                                {activeWallet === 'PAYPAL' && paypalPaySource === 'saved' && (
-                                    <div className="ml-6 space-y-1 border-l border-slate-200 pl-3">
-                                        {paypalSavedRows.map((m) => (
-                                            <label
-                                                key={m.id}
-                                                className="flex cursor-pointer items-center gap-2 text-sm text-slate-800"
-                                            >
-                                                <input
-                                                    type="radio"
-                                                    name="paypalVaultPick"
-                                                    checked={selectedPaypalVaultId === m.paypalVaultId}
-                                                    onChange={() => {
-                                                        setActiveWallet('PAYPAL');
-                                                        setPaypalPaySource('saved');
-                                                        setSelectedPaypalVaultId(String(m.paypalVaultId));
-                                                    }}
-                                                    disabled={disabled || busy}
-                                                />
-                                                <span>
-                                                    {m.paypalEmail
-                                                        ? String(m.paypalEmail)
-                                                        : `Vault ${String(m.paypalVaultId).slice(0, 8)}…`}
-                                                    {m.isDefault ? ' · default' : ''}
-                                                </span>
-                                            </label>
-                                        ))}
-                                    </div>
-                                )}
-                                <label className="flex cursor-pointer items-center gap-2 text-sm">
-                                    <input
-                                        type="radio"
-                                        name="checkout-pay-rail"
-                                        checked={activeWallet === 'PAYPAL' && paypalPaySource === 'redirect'}
-                                        onChange={() => {
-                                            setActiveWallet('PAYPAL');
-                                            setPaypalPaySource('redirect');
-                                        }}
-                                        disabled={disabled || busy}
-                                    />
-                                    <span>Log in with PayPal each time</span>
-                                </label>
-                            </fieldset>
-                        )}
+                <div className="rounded-xl border border-indigo-100 bg-indigo-50/30 p-4 shadow-sm">
+                    <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                        <h4 className="text-sm font-semibold text-slate-900">Use a saved payment method</h4>
+                        <Link
+                            to="/settings/payment"
+                            className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
+                        >
+                            Manage saved payments
+                        </Link>
                     </div>
-                )}
+                    {stripeSavedRows.length > 0 && !useManualStripe && (
+                        <fieldset className="mb-4 space-y-2">
+                            <legend className="text-xs font-medium text-slate-600">Card (Stripe)</legend>
+                            <label className="flex cursor-pointer items-center gap-2 text-sm">
+                                <input
+                                    type="radio"
+                                    name="checkout-pay-rail"
+                                    checked={activeWallet === 'STRIPE' && stripePaySource === 'saved'}
+                                    onChange={() => {
+                                        setActiveWallet('STRIPE');
+                                        setStripePaySource('saved');
+                                        setSaveNewCardAfterPay(false);
+                                    }}
+                                    disabled={disabled || busy}
+                                />
+                                <span>Saved card</span>
+                            </label>
+                            {activeWallet === 'STRIPE' && stripePaySource === 'saved' && (
+                                <div className="ml-6 space-y-1 border-l border-slate-200 pl-3">
+                                    {stripeSavedRows.map((m) => (
+                                        <label
+                                            key={m.id}
+                                            className="flex cursor-pointer items-center gap-2 text-sm text-slate-800"
+                                        >
+                                            <input
+                                                type="radio"
+                                                name="stripeSavedPm"
+                                                checked={selectedStripePmId === m.stripePaymentMethodId}
+                                                onChange={() => {
+                                                    setActiveWallet('STRIPE');
+                                                    setStripePaySource('saved');
+                                                    setSelectedStripePmId(String(m.stripePaymentMethodId));
+                                                    setSaveNewCardAfterPay(false);
+                                                }}
+                                                disabled={disabled || busy}
+                                            />
+                                            <span>
+                                                {(m.brand || 'Card').toString()} •••• {m.last4 || '????'}
+                                                {m.expMonth && m.expYear
+                                                    ? ` · ${m.expMonth}/${m.expYear}`
+                                                    : ''}
+                                                {m.isDefault ? ' · default' : ''}
+                                            </span>
+                                        </label>
+                                    ))}
+                                </div>
+                            )}
+                            <label className="flex cursor-pointer items-center gap-2 text-sm">
+                                <input
+                                    type="radio"
+                                    name="checkout-pay-rail"
+                                    checked={activeWallet === 'STRIPE' && stripePaySource === 'new'}
+                                    onChange={() => {
+                                        setActiveWallet('STRIPE');
+                                        setStripePaySource('new');
+                                    }}
+                                    disabled={disabled || busy}
+                                />
+                                <span>New card (form below)</span>
+                            </label>
+                        </fieldset>
+                    )}
+                    {paypalSavedRows.length > 0 && (
+                        <fieldset className="space-y-2">
+                            <legend className="text-xs font-medium text-slate-600">PayPal</legend>
+                            <label className="flex cursor-pointer items-center gap-2 text-sm">
+                                <input
+                                    type="radio"
+                                    name="checkout-pay-rail"
+                                    checked={activeWallet === 'PAYPAL' && paypalPaySource === 'saved'}
+                                    onChange={() => {
+                                        setActiveWallet('PAYPAL');
+                                        setPaypalPaySource('saved');
+                                    }}
+                                    disabled={disabled || busy}
+                                />
+                                <span>Saved PayPal</span>
+                            </label>
+                            {activeWallet === 'PAYPAL' && paypalPaySource === 'saved' && (
+                                <div className="ml-6 space-y-1 border-l border-slate-200 pl-3">
+                                    {paypalSavedRows.map((m) => (
+                                        <label
+                                            key={m.id}
+                                            className="flex cursor-pointer items-center gap-2 text-sm text-slate-800"
+                                        >
+                                            <input
+                                                type="radio"
+                                                name="paypalVaultPick"
+                                                checked={selectedPaypalVaultId === m.paypalVaultId}
+                                                onChange={() => {
+                                                    setActiveWallet('PAYPAL');
+                                                    setPaypalPaySource('saved');
+                                                    setSelectedPaypalVaultId(String(m.paypalVaultId));
+                                                }}
+                                                disabled={disabled || busy}
+                                            />
+                                            <span>
+                                                {m.paypalEmail
+                                                    ? String(m.paypalEmail)
+                                                    : `Vault ${String(m.paypalVaultId).slice(0, 8)}…`}
+                                                {m.isDefault ? ' · default' : ''}
+                                            </span>
+                                        </label>
+                                    ))}
+                                </div>
+                            )}
+                            <label className="flex cursor-pointer items-center gap-2 text-sm">
+                                <input
+                                    type="radio"
+                                    name="checkout-pay-rail"
+                                    checked={activeWallet === 'PAYPAL' && paypalPaySource === 'redirect'}
+                                    onChange={() => {
+                                        setActiveWallet('PAYPAL');
+                                        setPaypalPaySource('redirect');
+                                    }}
+                                    disabled={disabled || busy}
+                                />
+                                <span>Log in with PayPal each time</span>
+                            </label>
+                        </fieldset>
+                    )}
+                </div>
+            )}
 
             {stripePromise && !useManualStripe && activeWallet === 'STRIPE' && stripePaySource === 'new' && (
                 <Elements stripe={stripePromise}>

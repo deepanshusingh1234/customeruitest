@@ -1,5 +1,10 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
-import api from '../lib/api';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import api, {
+    registerSessionRefreshed,
+    runSharedRefresh,
+    clearAuthStorage,
+    forceLogoutAndRedirect,
+} from '../lib/api';
 
 const AuthContext = createContext();
 
@@ -11,53 +16,116 @@ export const useAuth = () => {
     return context;
 };
 
+const applySession = (customer, accessToken, setUser, setToken) => {
+    if (accessToken) {
+        setToken(accessToken);
+        api.defaults.headers.common.Authorization = `Bearer ${accessToken}`;
+    }
+    if (customer) {
+        setUser(customer);
+    }
+    if (accessToken === null && customer === null) {
+        setUser(null);
+        setToken(null);
+    }
+};
+
 export const AuthProvider = ({ children }) => {
     const [user, setUser] = useState(null);
-    const [token, setToken] = useState(localStorage.getItem('accessToken'));
+    const [token, setToken] = useState(() => localStorage.getItem('accessToken'));
     const [loading, setLoading] = useState(true);
+
+    const clearSession = useCallback(() => {
+        clearAuthStorage();
+        setUser(null);
+        setToken(null);
+    }, []);
+
+    useEffect(() => {
+        registerSessionRefreshed(({ customer, accessToken }) => {
+            if (accessToken === null && customer === null) {
+                setUser(null);
+                setToken(null);
+                return;
+            }
+            applySession(customer, accessToken, setUser, setToken);
+        });
+        return () => registerSessionRefreshed(null);
+    }, []);
+
+    useEffect(() => {
+        const bootstrap = async () => {
+            const path = window.location.pathname.replace(/\/$/, '') || '/';
+            if (path === '/login') {
+                setLoading(false);
+                return;
+            }
+
+            const storedToken = localStorage.getItem('accessToken');
+            const storedUser = localStorage.getItem('user');
+            const hadSession = Boolean(storedToken || storedUser);
+
+            if (storedToken) {
+                api.defaults.headers.common.Authorization = `Bearer ${storedToken}`;
+            }
+            if (storedUser) {
+                try {
+                    setUser(JSON.parse(storedUser));
+                } catch {
+                    localStorage.removeItem('user');
+                }
+            }
+
+            try {
+                const res = await runSharedRefresh();
+                applySession(res.data?.customer, res.data?.accessToken, setUser, setToken);
+            } catch {
+                if (hadSession) {
+                    clearSession();
+                    forceLogoutAndRedirect();
+                }
+            } finally {
+                setLoading(false);
+            }
+        };
+
+        void bootstrap();
+    }, [clearSession]);
 
     useEffect(() => {
         if (token) {
-            const storedUser = localStorage.getItem('user');
-            if (storedUser) {
-                setUser(JSON.parse(storedUser));
-            }
-            api.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+            api.defaults.headers.common.Authorization = `Bearer ${token}`;
         }
-        setLoading(false);
     }, [token]);
 
     const login = async (email, password) => {
         try {
             const response = await api.post('/customer/auth/login', {
                 email,
-                password
+                password,
             });
 
             const { customer, accessToken } = response.data;
-            setUser(customer);
-            setToken(accessToken);
+            applySession(customer, accessToken, setUser, setToken);
             localStorage.setItem('accessToken', accessToken);
             localStorage.setItem('user', JSON.stringify(customer));
-
-            // Set default axios header
-            api.defaults.headers.common['Authorization'] = `Bearer ${accessToken}`;
 
             return { success: true, data: response.data };
         } catch (error) {
             return {
                 success: false,
-                error: error.response?.data?.message || 'Login failed'
+                error: error.response?.data?.error || error.response?.data?.message || 'Login failed',
             };
         }
     };
 
-    const logout = () => {
-        setUser(null);
-        setToken(null);
-        localStorage.removeItem('accessToken');
-        localStorage.removeItem('user');
-        delete api.defaults.headers.common['Authorization'];
+    const logout = async () => {
+        try {
+            await api.post('/customer/auth/logout');
+        } catch {
+            // Still clear local session if server logout fails
+        }
+        clearSession();
     };
 
     const value = {
@@ -65,7 +133,7 @@ export const AuthProvider = ({ children }) => {
         token,
         login,
         logout,
-        loading
+        loading,
     };
 
     return (
