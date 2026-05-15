@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { loadStripe } from '@stripe/stripe-js';
 import { Elements, CardElement, useStripe, useElements } from '@stripe/react-stripe-js';
@@ -23,6 +23,14 @@ function normalizeCouponCodes(list) {
 
 function couponPricingFromSummary(summary) {
     return summary?.couponPricing ?? summary?.pricing ?? null;
+}
+
+/** Ship-in checkout: use API list from the shipment warehouse. Batch checkout: unchanged (all rails). */
+function allowedPaymentProvidersForUi(checkoutMode, summary) {
+    if (checkoutMode === 'batch') return ['STRIPE', 'PAYPAL'];
+    const pp = summary?.paymentProviders;
+    if (!Array.isArray(pp)) return ['STRIPE', 'PAYPAL'];
+    return pp.filter((x) => x === 'STRIPE' || x === 'PAYPAL');
 }
 
 const publishableKey = import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY || '';
@@ -220,6 +228,13 @@ export default function CheckoutPaymentPanel({
 
     const couponCodes = normalizeCouponCodes(summary?.couponCodes ?? []);
 
+    const allowedPaymentProviders = useMemo(
+        () => allowedPaymentProvidersForUi(checkoutMode, summary),
+        [checkoutMode, summary?.paymentProviders],
+    );
+    const stripeAllowed = allowedPaymentProviders.includes('STRIPE');
+    const paypalAllowed = allowedPaymentProviders.includes('PAYPAL');
+
     const batchShipInKey =
         checkoutMode === 'batch' && Array.isArray(batchContext?.shipInIds)
             ? batchContext.shipInIds.join(',')
@@ -233,31 +248,40 @@ export default function CheckoutPaymentPanel({
                 if (cancelled) return;
                 setSavedPaymentMethods(Array.isArray(list) ? list : []);
                 const stripeRows = (list || []).filter(
-                    (m) => m.provider === 'STRIPE' && String(m.stripePaymentMethodId || '').trim(),
+                    (m) =>
+                        stripeAllowed &&
+                        m.provider === 'STRIPE' &&
+                        String(m.stripePaymentMethodId || '').trim(),
                 );
                 const pick =
                     stripeRows.find((m) => m.isDefault) || (stripeRows.length ? stripeRows[0] : null);
                 const ppRows = (list || []).filter(
-                    (m) => m.provider === 'PAYPAL' && String(m.paypalVaultId || '').trim(),
+                    (m) =>
+                        paypalAllowed && m.provider === 'PAYPAL' && String(m.paypalVaultId || '').trim(),
                 );
                 const ppPick =
                     ppRows.find((m) => m.isDefault) || (ppRows.length === 1 ? ppRows[0] : null);
-                if (pick?.stripePaymentMethodId) {
+                if (stripeAllowed && pick?.stripePaymentMethodId) {
                     setActiveWallet('STRIPE');
                     setStripePaySource('saved');
                     setSelectedStripePmId(String(pick.stripePaymentMethodId));
                     setSaveNewCardAfterPay(false);
                     setPaypalPaySource('redirect');
-                } else if (!stripeRows.length && ppRows.length) {
+                } else if (paypalAllowed && !stripeRows.length && ppRows.length) {
                     setActiveWallet('PAYPAL');
                     setStripePaySource('new');
                     setSelectedStripePmId('');
                     setPaypalPaySource(ppPick?.paypalVaultId ? 'saved' : 'redirect');
-                } else {
+                } else if (stripeAllowed) {
                     setActiveWallet('STRIPE');
                     setStripePaySource('new');
                     setSelectedStripePmId('');
                     setPaypalPaySource('redirect');
+                } else if (paypalAllowed) {
+                    setActiveWallet('PAYPAL');
+                    setStripePaySource('new');
+                    setSelectedStripePmId('');
+                    setPaypalPaySource(ppPick?.paypalVaultId ? 'saved' : 'redirect');
                 }
                 if (ppPick?.paypalVaultId) {
                     setSelectedPaypalVaultId(String(ppPick.paypalVaultId));
@@ -271,7 +295,7 @@ export default function CheckoutPaymentPanel({
         return () => {
             cancelled = true;
         };
-    }, [shipmentId, checkoutMode, batchShipInKey]);
+    }, [shipmentId, checkoutMode, batchShipInKey, stripeAllowed, paypalAllowed]);
 
     const { currency: payCurrency, amount: payAmount, fromLocked, fromSummary, couponPricing } = resolveCheckoutMoney(
         lockedCarrierOption,
@@ -381,6 +405,19 @@ export default function CheckoutPaymentPanel({
             return;
         }
 
+        if (
+            checkoutMode === 'shipin' &&
+            allowedPaymentProviders.length > 0 &&
+            !allowedPaymentProviders.includes(provider)
+        ) {
+            toast.error('This payment option is not available for this shipment warehouse.');
+            return;
+        }
+        if (checkoutMode === 'shipin' && allowedPaymentProviders.length === 0) {
+            toast.error('No payment options are configured for this shipment warehouse.');
+            return;
+        }
+
         let effectiveStripePm = '';
         if (provider === 'STRIPE') {
             if (useManualStripe) {
@@ -397,7 +434,10 @@ export default function CheckoutPaymentPanel({
         }
 
         const hasSavedPaypalMethods = savedPaymentMethods.some(
-            (m) => m.provider === 'PAYPAL' && String(m.paypalVaultId || '').trim(),
+            (m) =>
+                paypalAllowed &&
+                m.provider === 'PAYPAL' &&
+                String(m.paypalVaultId || '').trim(),
         );
         if (provider === 'PAYPAL' && hasSavedPaypalMethods && activeWallet !== 'PAYPAL') {
             toast.error('Select PayPal under saved payment methods to pay with PayPal.');
@@ -410,7 +450,10 @@ export default function CheckoutPaymentPanel({
         }
 
         const hasSavedStripeMethods = savedPaymentMethods.some(
-            (m) => m.provider === 'STRIPE' && String(m.stripePaymentMethodId || '').trim(),
+            (m) =>
+                stripeAllowed &&
+                m.provider === 'STRIPE' &&
+                String(m.stripePaymentMethodId || '').trim(),
         );
         if (provider === 'STRIPE' && !useManualStripe && hasSavedStripeMethods && activeWallet !== 'STRIPE') {
             toast.error('Select a card option under saved payment methods to pay with Stripe.');
@@ -570,10 +613,11 @@ export default function CheckoutPaymentPanel({
     };
 
     const stripeSavedRows = savedPaymentMethods.filter(
-        (m) => m.provider === 'STRIPE' && String(m.stripePaymentMethodId || '').trim(),
+        (m) =>
+            stripeAllowed && m.provider === 'STRIPE' && String(m.stripePaymentMethodId || '').trim(),
     );
     const paypalSavedRows = savedPaymentMethods.filter(
-        (m) => m.provider === 'PAYPAL' && String(m.paypalVaultId || '').trim(),
+        (m) => paypalAllowed && m.provider === 'PAYPAL' && String(m.paypalVaultId || '').trim(),
     );
     /** When saved PayPal methods exist, the yellow button only runs PayPal if that rail is selected. */
     const payPalCtaRequiresWalletSelection = paypalSavedRows.length > 0;
@@ -741,6 +785,12 @@ export default function CheckoutPaymentPanel({
                 )}
             </div>
 
+            {checkoutMode === 'shipin' && !stripeAllowed && !paypalAllowed && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50/90 p-4 text-sm text-amber-950">
+                    No payment methods are enabled for this shipment&apos;s warehouse. Contact support.
+                </div>
+            )}
+
             {stripeSavedRows.length + paypalSavedRows.length > 0 && (
                 <div className="rounded-xl border border-indigo-100 bg-indigo-50/30 p-4 shadow-sm">
                     <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -876,7 +926,7 @@ export default function CheckoutPaymentPanel({
                 </div>
             )}
 
-            {stripePromise && !useManualStripe && activeWallet === 'STRIPE' && stripePaySource === 'new' && (
+            {stripeAllowed && stripePromise && !useManualStripe && activeWallet === 'STRIPE' && stripePaySource === 'new' && (
                 <Elements stripe={stripePromise}>
                     <StripePayForm
                         disabled={disabled}
@@ -888,7 +938,8 @@ export default function CheckoutPaymentPanel({
                 </Elements>
             )}
 
-            {stripePromise &&
+            {stripeAllowed &&
+                stripePromise &&
                 !useManualStripe &&
                 activeWallet === 'STRIPE' &&
                 stripePaySource === 'new' &&
@@ -913,7 +964,7 @@ export default function CheckoutPaymentPanel({
                     </div>
                 )}
 
-            {!useManualStripe && activeWallet === 'STRIPE' && stripePaySource === 'saved' && selectedStripePmId && (
+            {!useManualStripe && stripeAllowed && activeWallet === 'STRIPE' && stripePaySource === 'saved' && selectedStripePmId && (
                 <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
                     <p className="text-sm text-slate-700">Pay with your saved card on file.</p>
                     <button
@@ -928,7 +979,7 @@ export default function CheckoutPaymentPanel({
                 </div>
             )}
 
-            {stripePromise && (
+            {stripeAllowed && stripePromise && (
                 <button
                     type="button"
                     onClick={() => {
@@ -943,7 +994,7 @@ export default function CheckoutPaymentPanel({
                 </button>
             )}
 
-            {(useManualStripe || !stripePromise) && (
+            {(useManualStripe || !stripePromise) && stripeAllowed && (
                 <div className="rounded-xl border border-dashed border-slate-300 bg-white p-4">
                     <label className="block text-xs font-medium uppercase tracking-wide text-slate-500">
                         Stripe payment method id
@@ -965,6 +1016,7 @@ export default function CheckoutPaymentPanel({
                 </div>
             )}
 
+            {stripeAllowed && paypalAllowed && (
             <div className="relative">
                 <div className="absolute inset-0 flex items-center" aria-hidden>
                     <div className="w-full border-t border-slate-200" />
@@ -973,7 +1025,9 @@ export default function CheckoutPaymentPanel({
                     <span className="bg-slate-50 px-2 text-slate-400">or</span>
                 </div>
             </div>
+            )}
 
+            {paypalAllowed && (
             <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
                 <div className="mb-3 space-y-2 text-xs text-slate-600">
                     <div className="flex items-start gap-2">
@@ -1023,8 +1077,9 @@ export default function CheckoutPaymentPanel({
                     )}
                 </button>
             </div>
+            )}
 
-            {!publishableKey && (
+            {!publishableKey && stripeAllowed && (
                 <p className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
                     For the embedded card form, add{' '}
                     <code className="rounded bg-amber-100/80 px-1">VITE_STRIPE_PUBLISHABLE_KEY</code> to{' '}
